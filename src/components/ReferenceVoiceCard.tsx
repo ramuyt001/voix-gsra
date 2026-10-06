@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { 
   UploadCloud, 
   FileAudio, 
@@ -32,6 +32,98 @@ export const ReferenceVoiceCard: React.FC<ReferenceVoiceCardProps> = ({
   const [dragActive, setDragActive] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  const [pendingAudio, setPendingAudio] = useState<{ buffer: AudioBuffer; url: string; name: string } | null>(null);
+  const [clipStart, setClipStart] = useState(0);
+  const [clipEnd, setClipEnd] = useState(0);
+  const previewRef = useRef<HTMLAudioElement>(null);
+  const importingRef = useRef(false);
+
+  useEffect(() => {
+    return () => { if (pendingAudio) URL.revokeObjectURL(pendingAudio.url); };
+  }, [pendingAudio]);
+
+  useEffect(() => {
+    return () => { if (currentProfile?.audioUrl) URL.revokeObjectURL(currentProfile.audioUrl); };
+  }, [currentProfile?.audioUrl]);
+
+  // Encode uniquement le passage sélectionné en WAV mono.
+  const makeWav = (buffer: AudioBuffer, start: number, end: number): Blob => {
+    const first = Math.floor(start * buffer.sampleRate);
+    const last = Math.min(buffer.length, Math.floor(end * buffer.sampleRate));
+    const count = last - first;
+    const bytes = new ArrayBuffer(44 + count * 2);
+    const view = new DataView(bytes);
+    const text = (offset: number, value: string) => {
+      for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
+    };
+    text(0, 'RIFF'); view.setUint32(4, 36 + count * 2, true);
+    text(8, 'WAVE'); text(12, 'fmt '); view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, buffer.sampleRate, true);
+    view.setUint32(28, buffer.sampleRate * 2, true);
+    view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    text(36, 'data'); view.setUint32(40, count * 2, true);
+    const channels = Array.from({ length: buffer.numberOfChannels }, (_, ch) => buffer.getChannelData(ch));
+    for (let i = 0; i < count; i++) {
+      const sample = Math.max(-1, Math.min(1, channels.reduce((sum, channel) => sum + channel[first + i], 0) / channels.length));
+      view.setInt16(44 + i * 2, Math.round(sample * (sample < 0 ? 32768 : 32767)), true);
+    }
+    return new Blob([bytes], { type: 'audio/wav' });
+  };
+
+  const handleFile = async (file: File) => {
+    if (disabled || importingRef.current) return;
+    setErrorMsg(null);
+    if (!file.type.startsWith('audio/') && !file.type.startsWith('video/') &&
+        !/\.(wav|mp3|m4a|ogg|flac|aac|mp4|mov|webm)$/i.test(file.name)) {
+      setErrorMsg('Choisissez un audio ou une vidéo MP4, MOV ou WebM.');
+      return;
+    }
+    if (!file.size || file.size > 100 * 1024 * 1024) {
+      setErrorMsg('Le fichier est vide ou dépasse la limite de 100 Mo.');
+      return;
+    }
+    importingRef.current = true;
+    setIsAnalyzing(true);
+    let context: AudioContext | null = null;
+    try {
+      context = new AudioContext();
+      const buffer = await context.decodeAudioData(await file.arrayBuffer());
+      if (!buffer.length || !buffer.numberOfChannels || !Number.isFinite(buffer.duration)) {
+        throw new Error('Aucune piste audio exploitable dans ce fichier.');
+      }
+      const url = URL.createObjectURL(makeWav(buffer, 0, buffer.duration));
+      setPendingAudio({ buffer, url, name: file.name });
+      setClipStart(0);
+      setClipEnd(Math.min(60, buffer.duration));
+    } catch (err) {
+      setErrorMsg('Extraction impossible : fichier sans piste audio décodable, endommagé ou codec incompatible avec ce navigateur. Essayez un MP4 avec son AAC ou un fichier WAV/MP3.');
+    } finally {
+      if (context) await context.close().catch(() => {});
+      importingRef.current = false;
+      setIsAnalyzing(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const validateClip = async () => {
+    if (!pendingAudio || disabled || isAnalyzing) return;
+    if (!Number.isFinite(clipStart) || !Number.isFinite(clipEnd) || clipStart < 0 ||
+        clipEnd > pendingAudio.buffer.duration || clipEnd - clipStart < 0.1) {
+      setErrorMsg('Choisissez un début et une fin valides, avec au moins 0,1 seconde de son.');
+      return;
+    }
+    previewRef.current?.pause();
+    if ((clipEnd - clipStart) * pendingAudio.buffer.sampleRate * 2 > 30 * 1024 * 1024) {
+      setErrorMsg('Passage trop long : sélectionnez un extrait plus court (20 à 60 secondes recommandées).');
+      return;
+    }
+    setErrorMsg(null);
+    const wav = makeWav(pendingAudio.buffer, clipStart, clipEnd);
+    const file = new File([wav], pendingAudio.name.replace(/\.[^.]+$/, '') + '-reference.wav', { type: 'audio/wav' });
+    await analyzeFile(file, clipEnd - clipStart, pendingAudio.buffer.sampleRate);
+  };
+
   // Gérer la lecture / pause de l'audio de référence
   const togglePlay = () => {
     if (!audioPlayerRef.current) return;
@@ -47,94 +139,25 @@ export const ReferenceVoiceCard: React.FC<ReferenceVoiceCardProps> = ({
     }
   };
 
-  // Traitement et analyse du fichier audio
-  const handleFile = async (file: File) => {
-    setErrorMsg(null);
-    if (!file.type.startsWith('audio/') && !file.name.match(/\.(wav|mp3|m4a|ogg|flac|aac)$/i)) {
-      setErrorMsg("Veuillez sélectionner un fichier audio valide (.wav, .mp3, .m4a, .ogg).");
-      return;
-    }
-
-    try {
-      setIsAnalyzing(true);
-
-      // Convertir en base64 pour analyse
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        const base64Data = e.target?.result as string;
-        const audioUrl = URL.createObjectURL(file);
-
-        try {
-          const res = await fetch('/api/analyze-reference', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              base64Audio: base64Data,
-              fileName: file.name,
-              fileSize: file.size,
-              mimeType: file.type,
-            }),
-          });
-
-          if (!res.ok) {
-            throw new Error("Échec de l'analyse serveur.");
-          }
-
-          const data = await res.json();
-
-          const profile: ReferenceVoiceProfile = {
-            id: 'ref-' + Date.now(),
-            name: file.name,
-            fileSizeBytes: file.size,
-            durationSeconds: data.durationSeconds || 32,
-            sampleRate: data.sampleRate || 44100,
-            channels: data.channels || 1,
-            snrDb: data.snrDb || 28,
-            score: data.score || 88,
-            qualityLevel: data.qualityLevel || 'BONNE',
-            issues: data.issues || [],
-            strengths: data.strengths || [],
-            format: data.format || file.type,
-            audioUrl: audioUrl,
-            base64Data: base64Data,
-            detectedPitchHz: 135,
-            formantsProfile: [620, 1680, 2750], // F1, F2, F3
-          };
-
-          onProfileLoaded(profile);
-        } catch (serverErr) {
-          // Fallback d'analyse locale dans le navigateur si le serveur est indisponible
-          const profile: ReferenceVoiceProfile = {
-            id: 'ref-local-' + Date.now(),
-            name: file.name,
-            fileSizeBytes: file.size,
-            durationSeconds: 30,
-            sampleRate: 48000,
-            channels: 1,
-            snrDb: 26,
-            score: 82,
-            qualityLevel: 'BONNE',
-            issues: [],
-            strengths: [
-              "Fichier analysé avec succès dans le navigateur.",
-              "Prêt pour le profil acoustique Darija & Français."
-            ],
-            format: file.name.endsWith('.wav') ? 'WAV non compressé' : file.type,
-            audioUrl: audioUrl,
-            detectedPitchHz: 140,
-            formantsProfile: [640, 1720, 2800],
-          };
-          onProfileLoaded(profile);
-        } finally {
-          setIsAnalyzing(false);
-        }
-      };
-
-      reader.readAsDataURL(file);
-    } catch (err: any) {
-      setErrorMsg("Erreur lors de la lecture du fichier : " + err.message);
-      setIsAnalyzing(false);
-    }
+  // L'import reste local : aucune référence n'est envoyée au serveur.
+  const analyzeFile = async (file: File, duration: number, sampleRate: number) => {
+    const audioUrl = URL.createObjectURL(file);
+    onProfileLoaded({
+      id: 'ref-media-' + Date.now(),
+      name: file.name,
+      fileSizeBytes: file.size,
+      durationSeconds: duration,
+      sampleRate,
+      channels: 1,
+      snrDb: 0,
+      score: 0,
+      qualityLevel: 'INSUFFISANTE',
+      issues: ['La qualité acoustique et la ressemblance vocale ne sont pas évaluées par cet import.'],
+      strengths: ['Passage extrait et décodé localement, prêt à être écouté.'],
+      format: 'WAV PCM — extrait local',
+      audioUrl,
+    });
+    setPendingAudio(null);
   };
 
   // Charger un exemple représentatif (voix ami parlant Darija + Français)
@@ -168,7 +191,7 @@ export const ReferenceVoiceCard: React.FC<ReferenceVoiceCardProps> = ({
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragActive(false);
-    if (disabled) return;
+    if (disabled || isAnalyzing) return;
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       handleFile(e.dataTransfer.files[0]);
     }
@@ -186,7 +209,7 @@ export const ReferenceVoiceCard: React.FC<ReferenceVoiceCardProps> = ({
               Voix de Référence de l&apos;Ami
             </h2>
             <p className="text-xs text-neutral-400">
-              Audio source pour cloner le timbre vocal sans modifier vos intonations
+              Audio ou vidéo source : choisissez le passage à utiliser comme référence
             </p>
           </div>
         </div>
@@ -205,7 +228,42 @@ export const ReferenceVoiceCard: React.FC<ReferenceVoiceCardProps> = ({
       </div>
 
       {/* Zone de glisser-déposer / Import */}
-      {!currentProfile ? (
+      {pendingAudio ? (
+        <div className="bg-neutral-950/60 border border-neutral-800 rounded-xl p-4 space-y-3">
+          <p className="text-sm text-white break-all">{pendingAudio.name}</p>
+          <p className="text-xs text-neutral-400">Écoutez et choisissez un passage où votre ami parle seul, sans musique. Extraction locale, avant analyse.</p>
+          <audio ref={previewRef} controls src={pendingAudio.url} className="w-full"
+            onPlay={() => {
+              const player = previewRef.current;
+              if (player && (player.currentTime < clipStart || player.currentTime >= clipEnd)) player.currentTime = clipStart;
+            }}
+            onTimeUpdate={() => {
+              const player = previewRef.current;
+              if (player && player.currentTime >= clipEnd) { player.pause(); player.currentTime = clipStart; }
+            }} />
+          <div className="flex flex-wrap gap-3 text-xs text-neutral-300">
+            <label>Début (secondes)
+              <input type="number" min="0" max={pendingAudio.buffer.duration} step="0.1" value={clipStart}
+                disabled={disabled || isAnalyzing} onChange={e => setClipStart(Number(e.target.value))}
+                className="block bg-neutral-800 rounded p-2 mt-1 w-28" />
+            </label>
+            <label>Fin (secondes)
+              <input type="number" min="0" max={pendingAudio.buffer.duration} step="0.1" value={clipEnd}
+                disabled={disabled || isAnalyzing} onChange={e => setClipEnd(Number(e.target.value))}
+                className="block bg-neutral-800 rounded p-2 mt-1 w-28" />
+            </label>
+          </div>
+          <p className="text-xs text-neutral-400">Durée totale : {pendingAudio.buffer.duration.toFixed(1)} s. Passage : {Math.max(0, clipEnd - clipStart).toFixed(1)} s. Durée recommandée : 20 à 60 s.</p>
+          <div className="flex gap-3">
+            <button type="button" onClick={validateClip} disabled={disabled || isAnalyzing}
+              className="bg-amber-500 text-neutral-950 px-4 py-2 rounded-xl text-xs font-semibold disabled:opacity-50">
+              {isAnalyzing ? 'Analyse en cours…' : 'Valider ce passage'}
+            </button>
+            <button type="button" onClick={() => { previewRef.current?.pause(); setPendingAudio(null); setErrorMsg(null); }}
+              disabled={disabled || isAnalyzing} className="text-neutral-300 text-xs">Annuler</button>
+          </div>
+        </div>
+      ) : !currentProfile ? (
         <div
           onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
           onDragLeave={() => setDragActive(false)}
@@ -219,7 +277,7 @@ export const ReferenceVoiceCard: React.FC<ReferenceVoiceCardProps> = ({
           <input
             ref={fileInputRef}
             type="file"
-            accept="audio/*,.wav,.mp3,.m4a,.ogg"
+            accept="audio/*,video/mp4,video/quicktime,video/webm,.wav,.mp3,.m4a,.ogg,.flac,.aac,.mp4,.mov,.webm"
             onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
             className="hidden"
             disabled={disabled || isAnalyzing}
@@ -239,7 +297,7 @@ export const ReferenceVoiceCard: React.FC<ReferenceVoiceCardProps> = ({
                 {isAnalyzing ? "Analyse acoustique en cours..." : "Glissez l'enregistrement de votre ami ici"}
               </p>
               <p className="text-xs text-neutral-400 mt-1">
-                Formats acceptés : .WAV (recommandé), .MP3, .M4A • Durée idéale : 20 à 60 secondes
+                Audio : WAV, MP3, M4A, OGG, FLAC, AAC • Vidéo : MP4, MOV, WebM selon les codecs • Maximum : 100 Mo
               </p>
             </div>
 
@@ -250,7 +308,7 @@ export const ReferenceVoiceCard: React.FC<ReferenceVoiceCardProps> = ({
                 disabled={disabled || isAnalyzing}
                 className="cursor-pointer px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-white font-medium text-xs rounded-xl border border-neutral-600/60 transition shadow-sm"
               >
-                Parcourir les fichiers
+                Importer un audio ou une vidéo
               </button>
 
               <button
@@ -307,7 +365,7 @@ export const ReferenceVoiceCard: React.FC<ReferenceVoiceCardProps> = ({
                     : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
               }`}>
                 <CheckCircle2 className="w-3.5 h-3.5" />
-                Qualité {currentProfile.qualityLevel} ({currentProfile.score}/100)
+                {currentProfile.id.startsWith('ref-media-') ? 'Audio extrait localement' : `Qualité ${currentProfile.qualityLevel} (${currentProfile.score}/100)`}
               </span>
             </div>
           </div>
@@ -326,21 +384,21 @@ export const ReferenceVoiceCard: React.FC<ReferenceVoiceCardProps> = ({
             <div className="bg-neutral-900/60 p-2.5 rounded-lg border border-neutral-800">
               <span className="text-neutral-400 block mb-1">Rapport Signal/Bruit (SNR)</span>
               <span className="font-semibold text-emerald-400 text-sm">
-                ~{currentProfile.snrDb} dB (Clarté vocale)
+                {currentProfile.id.startsWith('ref-media-') ? 'Non mesuré' : `~${currentProfile.snrDb} dB (Clarté vocale)`}
               </span>
             </div>
 
             <div className="bg-neutral-900/60 p-2.5 rounded-lg border border-neutral-800">
               <span className="text-neutral-400 block mb-1">Hauteur vocale cible (F0)</span>
               <span className="font-semibold text-amber-300 text-sm">
-                ~{currentProfile.detectedPitchHz || 130} Hz (Voix masculine/naturelle)
+                {currentProfile.id.startsWith('ref-media-') ? 'Non mesurée' : `~${currentProfile.detectedPitchHz || 130} Hz (Voix masculine/naturelle)`}
               </span>
             </div>
 
             <div className="bg-neutral-900/60 p-2.5 rounded-lg border border-neutral-800">
               <span className="text-neutral-400 block mb-1">Darija + Français</span>
               <span className="font-semibold text-sky-300 text-sm">
-                Phonèmes &amp; intonations préservés
+                À vérifier par écoute
               </span>
             </div>
           </div>
@@ -381,7 +439,7 @@ export const ReferenceVoiceCard: React.FC<ReferenceVoiceCardProps> = ({
       <div className="mt-4 flex items-start gap-2 text-[11px] text-neutral-400 bg-neutral-950/40 p-2.5 rounded-xl border border-neutral-800/60">
         <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
         <p>
-          <strong className="text-neutral-200">Confidentialité garantie :</strong> L&apos;audio de votre ami est traité uniquement en mémoire vive (RAM) pour calculer la signature acoustique. Aucun fichier vocal n&apos;est conservé sur disque ni réutilisé après la session.
+          <strong className="text-neutral-200">Confidentialité garantie :</strong> L&apos;extraction et la sélection du passage restent dans votre navigateur. Cet import n&apos;envoie pas votre fichier au serveur et ne l&apos;enregistre pas sur disque.
         </p>
       </div>
     </div>

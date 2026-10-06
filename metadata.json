@@ -1,0 +1,10 @@
+{
+  "name": "VoiceBridge - Changeur de Voix Direct pour Snapchat Web",
+  "description": "Solution complète de conversion vocale directe (Voice-to-Voice) en temps réel pour appels Snapchat Web sur Windows, avec routage micro virtuel VB-Cable, préservation du français et de la darija algérienne, et mesure de latence.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
